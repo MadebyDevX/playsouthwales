@@ -1,0 +1,17 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { reconcile, inspect, parseAmount, csv, USDC, TRANSFER } from './public/receipt.mjs';
+const from = '0x' + '1'.repeat(40), to = '0x' + '2'.repeat(40), hash = '0x' + 'a'.repeat(64), blockHash = '0x' + 'b'.repeat(64);
+const word = address => '0x' + address.slice(2).padStart(64,'0');
+const log = (value, index = '0x0', recipient = to) => ({address:USDC,topics:[TRANSFER,word(from),word(recipient)],data:'0x'+BigInt(value).toString(16).padStart(64,'0'),logIndex:index});
+const receipt = logs => ({status:'0x1',logs,transactionHash:hash,blockNumber:'0x10',blockHash});
+test('exact six-decimal arithmetic and large values', () => { assert.equal(parseAmount('999999999999999999.123456'),999999999999999999123456n); assert.throws(()=>parseAmount('1.0000001')); assert.throws(()=>parseAmount('0')); });
+test('unified native event counted once, duplicate ignored', () => { const event=log(125000000); const r=receipt([event,event]); r.value='0x6c6b935b8bbd40000'; assert.equal(reconcile(r,to,'125').paid,'125.000000'); });
+test('wrong recipient, unrelated tokens and self transfers cannot match', () => { const wrong=log(125000000,'0x0',from), spoof={...log(125000000,'0x1'),address:from}, self={...log(125000000,'0x2'),topics:[TRANSFER,word(to),word(to)]}; assert.equal(reconcile(receipt([wrong,spoof,self]),to,'125').status,'no-payment'); });
+test('underpaid and overpaid aggregate recipient events',()=> { assert.equal(reconcile(receipt([log(1000000)]),to,'2').status,'underpaid'); assert.equal(reconcile(receipt([log(1000000),log(2000000,'0x1')]),to,'2').status,'overpaid'); });
+test('failed and missing receipts never match',()=> { assert.equal(reconcile({...receipt([log(2000000)]),status:'0x0'},to,'2').status,'failed'); assert.equal(reconcile(null,to,'2').status,'unconfirmed'); assert.throws(()=>reconcile({...receipt([]),status:'0x2'},to,'2')); });
+test('malformed official event is rejected',()=> { assert.throws(()=>reconcile(receipt([{...log(1),data:'0x1'}]),to,'1')); });
+function fakeFetcher(chain='0x13b2', altered={}) { return async (url,options)=> { const q=JSON.parse(options.body); const result=q.method==='eth_chainId'?chain:q.method==='eth_getTransactionReceipt'?{...receipt([log(2000000)]),...altered}:{hash:blockHash,number:'0x10',timestamp:'0x64'}; return {ok:true,json:async()=>({jsonrpc:'2.0',id:q.id,result})}; }; }
+test('RPC verifies chain, exact receipt hash and receipt block',async()=> { const r=await inspect({hash,recipient:to,expected:'2',fetcher:fakeFetcher()}); assert.equal(r.status,'matched'); assert.equal(r.timestamp,'1970-01-01T00:01:40.000Z'); await assert.rejects(()=>inspect({hash,recipient:to,expected:'2',fetcher:fakeFetcher('0x1')}),/Wrong network/); await assert.rejects(()=>inspect({hash,recipient:to,expected:'2',fetcher:fakeFetcher('0x13b2',{transactionHash:blockHash})}),/hash does not match/); });
+test('RPC outage/error or mismatched response cannot claim payment',async()=> { for(const payload of [{jsonrpc:'2.0',id:99,result:'0x13b2'},{jsonrpc:'2.0',id:1,error:{code:-1}}]) await assert.rejects(()=>inspect({hash,recipient:to,expected:'2',fetcher:async()=>({ok:true,json:async()=>payload})})); });
+test('CSV quotes and spreadsheet formula prefixes are inert',()=> { const output=csv({...reconcile(receipt([]),to,'2'),chainId:5042},'=HYPERLINK("x")'); assert.ok(output.includes('"\'=HYPERLINK(""x"")"')); assert.equal(output.split('\r\n').length,3); });
